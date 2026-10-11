@@ -1,0 +1,151 @@
+# ==========================================
+# Sistema operacional
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+*.lnk
+
+# ==========================================
+# Variáveis de ambiente e segredos
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ==========================================
+# Python: backend e client
+# ==========================================
+
+# Cache e arquivos compilados
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Ambientes virtuais
+.venv/
+venv/
+ENV/
+
+# Empacotamento e builds Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Testes e cobertura
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Type checking, lint e notebooks
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.ipynb_checkpoints/
+
+# Django / FastAPI locais
+media/
+staticfiles/
+celerybeat-schedule
+celerybeat.pid
+
+# ==========================================
+# Node.js / frontend
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# Builds e caches de frontend
+.vite/
+.next/
+nuxt.d.ts
+.nuxt/
+out/
+coverage/
+.cache/
+.parcel-cache/
+.turbo/
+
+# Ferramentas Node
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+.npm
+.yarn/cache
+.yarn/install-state.gz
+
+# ==========================================
+# Logs e arquivos temporários
+# ==========================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+
+# ==========================================
+# Excel, Word e arquivos temporários
+# ==========================================
+~$*.xlsx
+~$*.xls
+~$*.xlsm
+~$*.docx
+~$*.doc
+
+# ==========================================
+# Bancos de dados locais
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# ==========================================
+# IDEs e editores
+# ==========================================
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# ==========================================
+# Docker local
+# ==========================================
+.docker/
+docker-compose.override.yml
