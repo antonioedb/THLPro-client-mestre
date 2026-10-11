@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-
 import argparse
 import os
 import platform
 import threading
 import time
-
 
 from thlpro_client.api_client import APIError, THLProAPIClient
 from thlpro_client.app_paths import CLIENT_MUTEX_NAME, ensure_app_dirs
@@ -100,6 +98,7 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
             rtd_client=rtd,
             deduplicator=dedup,
             queue_enqueue=queue.enqueue_many,
+            queue_enqueue_asset=queue.enqueue_asset_quotes,
             simulation_mode=(rtd_mode == "simulate"),
         )
 
@@ -133,11 +132,7 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
         )
         watchdog_thread.start()
 
-        # Enfileira as séries para assinatura progressiva.
-        # O capture_worker assina os lotes no mesmo thread do Excel/RTD.
         capture.set_pending_config(cfg_payload)
-
-        # Inicia a captura imediatamente.
         capture.start_capture()
 
         def open_config_window():

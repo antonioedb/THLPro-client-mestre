@@ -7,7 +7,13 @@ from thlpro_client.api_client import APIError, THLProAPIClient, compute_backoff_
 
 
 class SenderService:
-    def __init__(self, logger: logging.Logger, api_client: THLProAPIClient, queue, heartbeat_seconds: int = 30):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        api_client: THLProAPIClient,
+        queue,
+        heartbeat_seconds: int = 30,
+    ):
         self.logger = logger
         self.api = api_client
         self.queue = queue
@@ -21,32 +27,74 @@ class SenderService:
         self.logger.info("Serviço de envio iniciado")
         attempt = 1
         hb_counter = 0
+
         while not self._stop.is_set():
             try:
                 hb_counter += 1
-                if hb_counter >= self.heartbeat_seconds * 2:  # loop de 0.5s
+
+                if hb_counter >= self.heartbeat_seconds * 2:
                     hb_counter = 0
                     self.api.heartbeat()
                     self.logger.info("Heartbeat enviado com sucesso")
 
-                batch = self.queue.dequeue_batch(100)
-                if not batch:
-                    self._stop.wait(0.5)
-                    continue
+                self._send_option_quotes()
+                self._send_asset_quotes()
 
-                ids = [row[0] for row in batch]
-                payload = [row[1] for row in batch]
-                result = self.api.send_quotes(payload)
-                self.queue.ack_ids(ids)
-                self.logger.info("Envio OK: accepted=%s rejected=%s", result.accepted, len(result.rejected))
-                for reject in result.rejected:
-                    self.logger.warning("Quote rejeitada: %s", reject)
                 attempt = 1
+                self._stop.wait(0.5)
+
             except APIError as exc:
                 delay = compute_backoff_seconds(attempt)
-                self.logger.error("Erro de rede/API (%s). Tentando novamente em %.1fs", exc, delay)
+                self.logger.error(
+                    "Erro de rede/API (%s). Tentando novamente em %.1fs",
+                    exc,
+                    delay,
+                )
                 attempt += 1
                 self._stop.wait(delay)
-            except Exception as exc:  # pragma: no cover
+
+            except Exception as exc:
                 self.logger.exception("Erro inesperado no sender: %s", exc)
                 self._stop.wait(1.0)
+
+    def _send_option_quotes(self) -> None:
+        batch = self.queue.dequeue_batch(100)
+
+        if not batch:
+            return
+
+        ids = [row[0] for row in batch]
+        payload = [row[1] for row in batch]
+
+        result = self.api.send_quotes(payload)
+        self.queue.ack_ids(ids)
+
+        self.logger.info(
+            "Envio de opções OK: accepted=%s rejected=%s",
+            result.accepted,
+            len(result.rejected),
+        )
+
+        for reject in result.rejected:
+            self.logger.warning("Quote rejeitada: %s", reject)
+
+    def _send_asset_quotes(self) -> None:
+        batch = self.queue.dequeue_asset_batch(100)
+
+        if not batch:
+            return
+
+        ids = [row[0] for row in batch]
+        payload = [row[1] for row in batch]
+
+        result = self.api.send_asset_quotes(payload)
+        self.queue.ack_asset_ids(ids)
+
+        self.logger.info(
+            "Envio de ativos-base OK: accepted=%s rejected=%s",
+            result.accepted,
+            len(result.rejected),
+        )
+
+        for reject in result.rejected:
+            self.logger.warning("Asset quote rejeitada: %s", reject)
