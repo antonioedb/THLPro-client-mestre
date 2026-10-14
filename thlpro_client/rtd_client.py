@@ -12,12 +12,18 @@ import requests
 from thlpro_client.compat_windows import IS_WINDOWS
 from thlpro_client.timezone_utils import now_iso_sp
 
+
 try:
     import pythoncom  # type: ignore
     import win32com.client  # type: ignore
 except Exception:  # pragma: no cover
     pythoncom = None
     win32com = None
+
+
+LEASE_RENEW_INTERVAL_SECONDS = 300
+
+RTD_SERVER_PROGID = "rtdtrading.rtdserver"
 
 
 @dataclass(slots=True)
@@ -46,11 +52,9 @@ class BaseRTDClient(abc.ABC):
         raise NotImplementedError
 
     def register_meta(self, option_series_id: int, rtd_symbol: str) -> None:
-        """Opcional: registra metadados da série no cliente RTD."""
         return None
 
     def register_asset(self, rtd_symbol: str) -> None:
-        """Opcional: registra um ativo-base, como BOVA11 ou ABEV3."""
         return None
 
     def subscribe_batch(
@@ -58,8 +62,7 @@ class BaseRTDClient(abc.ABC):
         rtd_symbols: list[str],
         fields: Iterable[str],
     ) -> list[str]:
-        """Assina várias séries. O padrão assina uma por uma."""
-        configured = []
+        configured: list[str] = []
 
         for rtd_symbol in rtd_symbols:
             self.subscribe(rtd_symbol, fields)
@@ -68,40 +71,59 @@ class BaseRTDClient(abc.ABC):
         return configured
 
 
-class ComRTDClient(BaseRTDClient):
-    """Leitura direta do RTD COM do Profit (mantida para referência/fallback)."""
+class ComProbeRTDClient(BaseRTDClient):
+    """
+    Diagnóstico somente.
+
+    Cria o objeto COM RTD sem abrir Excel para confirmar que o ProgID está
+    registrado. Não é um leitor de cotações: servidores RTD normalmente
+    dependem do protocolo/callback do Excel.
+    """
 
     def __init__(self, logger: logging.Logger):
         self.logger = logger
-        self._connected = False
-        self._subs: set[tuple[str, str]] = set()
         self._server = None
+        self._connected = False
 
     def connect(self) -> None:
         if not (IS_WINDOWS and pythoncom and win32com):
             raise RuntimeError(
-                "COM RTD só disponível em Windows com pywin32 instalado."
+                "COM RTD só está disponível no Windows com pywin32 instalado."
             )
 
         pythoncom.CoInitialize()
-        self._server = win32com.client.Dispatch("rtdtrading.rtdserver")
+
+        try:
+            self._server = win32com.client.Dispatch(RTD_SERVER_PROGID)
+        except Exception as exc:
+            pythoncom.CoUninitialize()
+            raise RuntimeError(
+                f"Não foi possível criar o servidor COM {RTD_SERVER_PROGID}: {exc}"
+            ) from exc
+
         self._connected = True
-        self.logger.info("Conectado ao servidor COM rtdtrading.rtdserver")
+
+        self.logger.info(
+            "Servidor COM %s criado sem Excel. "
+            "Este modo é somente diagnóstico e não captura cotações.",
+            RTD_SERVER_PROGID,
+        )
+
+        raise RuntimeError(
+            "O modo com_probe confirmou o servidor COM, mas não pode "
+            "capturar cotações sem o protocolo RTD/callback do Excel. "
+            "Use RTD_MODE=excel_bridge, RTD_MODE=profit_api ou execute "
+            "o cliente em uma máquina dedicada."
+        )
 
     def subscribe(self, rtd_symbol: str, fields: Iterable[str]) -> None:
-        for field in fields:
-            self._subs.add((rtd_symbol, field))
+        raise RuntimeError("com_probe não assina símbolos.")
 
     def poll_updates(self, timeout_seconds: float = 1.0) -> list[RTDUpdate]:
-        if not self._connected:
-            return []
-
-        time.sleep(timeout_seconds)
         return []
 
     def close(self) -> None:
         self._connected = False
-        self._subs.clear()
         self._server = None
 
         if IS_WINDOWS and pythoncom:
@@ -110,10 +132,12 @@ class ComRTDClient(BaseRTDClient):
 
 class ExcelBridgeRTDClient(BaseRTDClient):
     """
-    Lê o RTD do Profit através de uma instância oculta do Excel.
+    Ponte RTD por Excel oculto.
 
-    A fórmula usada é:
-    =RTD("rtdtrading.rtdserver";;"TICKER";"CAMPO")
+    IMPORTANTE:
+    Este modo cria uma segunda instância de EXCEL.EXE. Alguns servidores
+    RTD podem conflitar com planilhas Excel abertas pelo usuário. Use apenas
+    em máquina dedicada, VM, ou quando não houver planilha manual usando RTD.
     """
 
     def __init__(
@@ -123,26 +147,25 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         api_key: str = "",
     ):
         self.logger = logger
-        self.server_url = server_url
+        self.server_url = server_url.rstrip("/")
         self.api_key = api_key
 
         self._excel = None
         self._wb = None
         self._ws = None
 
-        # (symbol, field) -> célula
         self._subs: dict[tuple[str, str], str] = {}
-
-        # rtd_symbol -> option_series_id
         self._meta_by_symbol: dict[str, int] = {}
-
-        # Ativos-base não possuem option_series_id nem lease.
         self._asset_symbols: set[str] = set()
 
+        self._leased_option_ids: set[int] = set()
+        self._last_lease_renewal_at = 0.0
+
         self._row = 1
+        self._com_initialized = False
 
     def set_credentials(self, server_url: str, api_key: str) -> None:
-        self.server_url = server_url
+        self.server_url = server_url.rstrip("/")
         self.api_key = api_key
 
     def register_meta(
@@ -155,63 +178,142 @@ class ExcelBridgeRTDClient(BaseRTDClient):
     def register_asset(self, rtd_symbol: str) -> None:
         self._asset_symbols.add(rtd_symbol)
 
-    def _acquire_lease(self, option_series_id: int) -> bool:
+    def _request_leases_batch(
+        self,
+        option_series_ids: list[int],
+        action_label: str,
+    ) -> list[int]:
+        unique_ids = sorted(
+            {
+                int(option_series_id)
+                for option_series_id in option_series_ids
+                if option_series_id is not None and int(option_series_id) > 0
+            }
+        )
+
+        if not unique_ids:
+            return []
+
         if not (self.server_url and self.api_key):
-            return True
+            return unique_ids
 
         try:
-            resp = requests.post(
-                f"{self.server_url}/clients/lease/acquire",
-                params={"option_series_id": option_series_id},
+            response = requests.post(
+                f"{self.server_url}/clients/lease/acquire-batch",
+                json={"option_series_ids": unique_ids},
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=8,
+                timeout=15,
             )
-            return resp.status_code == 200
-        except requests.RequestException as exc:
+
+            if response.status_code != 200:
+                self.logger.warning(
+                    "Falha ao %s leases em lote: HTTP %s: %s",
+                    action_label,
+                    response.status_code,
+                    response.text,
+                )
+                return []
+
+            body = response.json()
+            acquired = body.get("acquired", [])
+
+            if not isinstance(acquired, list):
+                self.logger.warning(
+                    "Resposta inválida ao %s leases em lote: %r",
+                    action_label,
+                    body,
+                )
+                return []
+
+            return [
+                int(option_series_id)
+                for option_series_id in acquired
+                if option_series_id is not None and int(option_series_id) > 0
+            ]
+
+        except (TypeError, ValueError) as exc:
             self.logger.warning(
-                "Falha ao adquirir lease para %s: %s",
-                option_series_id,
+                "Resposta inválida ao %s leases em lote: %s",
+                action_label,
                 exc,
             )
-            return False
+            return []
+
+        except requests.RequestException as exc:
+            self.logger.warning(
+                "Falha ao %s leases em lote: %s",
+                action_label,
+                exc,
+            )
+            return []
 
     def _acquire_leases_batch(
         self,
         option_series_ids: list[int],
     ) -> list[int]:
+        return self._request_leases_batch(
+            option_series_ids,
+            action_label="adquirir",
+        )
+
+    def _renew_leases_if_needed(self) -> None:
         if not (self.server_url and self.api_key):
-            return option_series_ids
+            return
 
-        if not option_series_ids:
-            return []
+        now = time.monotonic()
 
-        try:
-            resp = requests.post(
-                f"{self.server_url}/clients/lease/acquire-batch",
-                json={"option_series_ids": option_series_ids},
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=15,
+        if (
+            now - self._last_lease_renewal_at
+            < LEASE_RENEW_INTERVAL_SECONDS
+        ):
+            return
+
+        option_ids = sorted(self._leased_option_ids)
+
+        if not option_ids:
+            self._last_lease_renewal_at = now
+            return
+
+        renewed_ids = self._request_leases_batch(
+            option_ids,
+            action_label="renovar",
+        )
+
+        renewed_set = set(renewed_ids)
+        expected_set = set(option_ids)
+
+        self._leased_option_ids.intersection_update(renewed_set)
+        self._last_lease_renewal_at = now
+
+        failed_ids = expected_set - renewed_set
+
+        if failed_ids:
+            failed_symbols = sorted(
+                symbol
+                for symbol, option_series_id in self._meta_by_symbol.items()
+                if option_series_id in failed_ids
             )
 
-            if resp.status_code != 200:
-                self.logger.warning(
-                    "Falha ao adquirir leases em lote: %s %s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return []
+            examples = ", ".join(failed_symbols[:10])
+            suffix = "..." if len(failed_symbols) > 10 else ""
 
-            body = resp.json()
-            return body.get("acquired", [])
-
-        except requests.RequestException as exc:
             self.logger.warning(
-                "Falha ao adquirir leases em lote: %s",
-                exc,
+                "Lease não renovado para %s opções. Exemplos: %s%s",
+                len(failed_ids),
+                examples,
+                suffix,
             )
-            return []
+            return
+
+        self.logger.info(
+            "Leases renovados para %s opções.",
+            len(renewed_ids),
+        )
 
     def _release_lease(self, option_series_id: int) -> None:
+        if option_series_id is None or option_series_id <= 0:
+            return
+
         if not (self.server_url and self.api_key):
             return
 
@@ -232,13 +334,15 @@ class ExcelBridgeRTDClient(BaseRTDClient):
     def connect(self) -> None:
         if not (IS_WINDOWS and pythoncom and win32com):
             raise RuntimeError(
-                "COM RTD só disponível em Windows com pywin32 instalado."
+                "Ponte Excel RTD disponível apenas em Windows com pywin32."
             )
 
-        if self._excel is not None and self._wb is not None and self._ws is not None:
+        if self._is_connected():
             return
 
-        pythoncom.CoInitialize()
+        if not self._com_initialized:
+            pythoncom.CoInitialize()
+            self._com_initialized = True
 
         self._excel = win32com.client.DispatchEx("Excel.Application")
         self._excel.Visible = False
@@ -248,12 +352,35 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         self._wb = self._excel.Workbooks.Add()
         self._ws = self._wb.Worksheets(1)
 
-        self.logger.info("Excel oculto iniciado como ponte RTD")
+        self.logger.warning(
+            "Excel oculto iniciado como ponte RTD. "
+            "Não abra planilhas RTD simultaneamente nesta máquina."
+        )
 
-    def _reset_excel(self) -> None:
-        self._excel = None
+    def _dispose_excel(self) -> None:
+        workbook = self._wb
+        excel = self._excel
+
         self._wb = None
         self._ws = None
+        self._excel = None
+
+        if workbook is not None:
+            try:
+                workbook.Close(SaveChanges=False)
+            except Exception:
+                pass
+
+        if excel is not None:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+
+    def _reset_excel(self) -> None:
+        self._dispose_excel()
+        self._subs.clear()
+        self._row = 1
 
     def subscribe(self, rtd_symbol: str, fields: Iterable[str]) -> None:
         self.subscribe_batch([rtd_symbol], fields)
@@ -263,102 +390,146 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         rtd_symbols: list[str],
         fields: Iterable[str],
     ) -> list[str]:
-        fields = list(fields)
+        requested_fields = list(dict.fromkeys(fields))
+
+        if not requested_fields:
+            return []
 
         option_symbols = [
-            symbol for symbol in rtd_symbols
+            symbol
+            for symbol in rtd_symbols
             if symbol not in self._asset_symbols
         ]
 
         asset_symbols = [
-            symbol for symbol in rtd_symbols
+            symbol
+            for symbol in rtd_symbols
             if symbol in self._asset_symbols
         ]
 
-        option_series_ids: list[int] = []
-        symbol_by_id: dict[int, str] = {}
+        option_ids: list[int] = []
+        symbol_by_option_id: dict[int, str] = {}
+        symbols_without_meta: list[str] = []
 
         for rtd_symbol in option_symbols:
             option_series_id = self._meta_by_symbol.get(rtd_symbol)
 
-            if option_series_id is None:
-                self.logger.warning(
-                    "Sem meta para %s, assumindo lease local",
-                    rtd_symbol,
-                )
-                option_series_id = 0
+            if option_series_id is None or option_series_id <= 0:
+                symbols_without_meta.append(rtd_symbol)
+                continue
 
-            option_series_ids.append(option_series_id)
-            symbol_by_id[option_series_id] = rtd_symbol
+            option_ids.append(option_series_id)
+            symbol_by_option_id[option_series_id] = rtd_symbol
 
-        acquired_ids = self._acquire_leases_batch(option_series_ids)
+        if symbols_without_meta:
+            self.logger.warning(
+                "Opções sem option_series_id não serão assinadas: %s",
+                ", ".join(symbols_without_meta[:10]),
+            )
+
+        acquired_ids = set(self._acquire_leases_batch(option_ids))
 
         acquired_symbols = [
-            symbol_by_id[option_series_id]
+            symbol_by_option_id[option_series_id]
             for option_series_id in acquired_ids
-            if option_series_id in symbol_by_id
+            if option_series_id in symbol_by_option_id
         ]
 
-        # Ativos-base não passam por lease.
-        acquired_symbols.extend(asset_symbols)
+        symbols_to_configure = acquired_symbols + asset_symbols
+
+        if not symbols_to_configure:
+            return []
 
         self.connect()
 
-        configured = []
+        configured: list[str] = []
 
-        for rtd_symbol in acquired_symbols:
+        for rtd_symbol in symbols_to_configure:
+            created_keys: list[tuple[str, str]] = []
             formula_failed = False
 
-            for field in fields:
+            for field in requested_fields:
                 key = (rtd_symbol, field)
 
                 if key in self._subs:
                     continue
 
                 cell = f"A{self._row}"
-
                 formula = (
-                    f'=RTD("rtdtrading.rtdserver";;'
+                    f'=RTD("{RTD_SERVER_PROGID}";;'
                     f'"{rtd_symbol}";"{field}")'
                 )
 
                 try:
                     self._ws.Range(cell).FormulaLocal = formula
-
                     self._subs[key] = cell
+                    created_keys.append(key)
                     self._row += 1
 
                 except Exception as exc:
                     formula_failed = True
 
                     self.logger.warning(
-                        "Falha ao assinar %s %s em %s: %s",
+                        "Falha ao assinar %s %s na célula %s: %s",
                         rtd_symbol,
                         field,
                         cell,
                         exc,
                     )
-
-                    self._reset_excel()
-
-                    try:
-                        self.connect()
-                    except Exception as reconnect_exc:
-                        self.logger.error(
-                            "Falha ao recriar Excel oculto: %s",
-                            reconnect_exc,
-                        )
-
                     break
 
-            if not formula_failed:
-                configured.append(rtd_symbol)
+            if formula_failed:
+                for key in created_keys:
+                    self._subs.pop(key, None)
+
+                try:
+                    self._reset_excel()
+                    self.connect()
+                except Exception as reconnect_exc:
+                    self.logger.error(
+                        "Falha ao recriar Excel oculto após erro RTD: %s",
+                        reconnect_exc,
+                    )
+
+                break
+
+            all_fields_configured = all(
+                (rtd_symbol, field) in self._subs
+                for field in requested_fields
+            )
+
+            if not all_fields_configured:
+                self.logger.warning(
+                    "Assinatura incompleta de %s; será tentada novamente.",
+                    rtd_symbol,
+                )
+                continue
+
+            configured.append(rtd_symbol)
+
+            option_series_id = self._meta_by_symbol.get(rtd_symbol)
+
+            if option_series_id is not None and option_series_id > 0:
+                self._leased_option_ids.add(option_series_id)
 
         if configured:
             self.logger.info(
-                "Assinadas %s séries. Campos por série: %s",
+                "RTD configurado: %s símbolos; %s campos por símbolo.",
                 len(configured),
-                len(fields),
+                len(requested_fields),
+            )
+
+        not_configured = set(rtd_symbols) - set(configured)
+
+        if not_configured:
+            examples = ", ".join(sorted(not_configured)[:10])
+            suffix = "..." if len(not_configured) > 10 else ""
+
+            self.logger.warning(
+                "RTD não confirmou %s símbolos. Exemplos: %s%s",
+                len(not_configured),
+                examples,
+                suffix,
             )
 
         return configured
@@ -367,6 +538,8 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         self,
         timeout_seconds: float = 1.0,
     ) -> list[RTDUpdate]:
+        self._renew_leases_if_needed()
+
         if not self._is_connected():
             return []
 
@@ -387,15 +560,16 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         if values is None:
             return []
 
-        if last_row == 1:
-            normalized_values = [(values,)]
-        else:
-            normalized_values = values
+        normalized_values = (
+            [(values,)]
+            if last_row == 1
+            else values
+        )
 
         updates: list[RTDUpdate] = []
         timestamp = now_iso_sp()
 
-        for (symbol, field), cell in self._subs.items():
+        for (symbol, field), cell in list(self._subs.items()):
             row = int(cell[1:])
 
             if row - 1 >= len(normalized_values):
@@ -428,36 +602,36 @@ class ExcelBridgeRTDClient(BaseRTDClient):
         )
 
     def close(self) -> None:
-        for symbol, option_series_id in self._meta_by_symbol.items():
+        for option_series_id in sorted(self._leased_option_ids):
             self._release_lease(option_series_id)
 
-        if self._wb:
-            try:
-                self._wb.Close(SaveChanges=False)
-            except Exception as exc:
-                self.logger.warning("Falha ao fechar pasta Excel: %s", exc)
+        self._leased_option_ids.clear()
+        self._last_lease_renewal_at = 0.0
 
-        if self._excel:
-            try:
-                self._excel.Quit()
-            except Exception as exc:
-                self.logger.warning("Falha ao encerrar Excel: %s", exc)
+        self._dispose_excel()
 
-        self._excel = None
-        self._wb = None
-        self._ws = None
         self._subs.clear()
+        self._meta_by_symbol.clear()
+        self._asset_symbols.clear()
+        self._row = 1
 
-        if IS_WINDOWS and pythoncom:
+        if self._com_initialized and IS_WINDOWS and pythoncom:
             pythoncom.CoUninitialize()
+            self._com_initialized = False
 
 
 class ProfitApiRtdClient(BaseRTDClient):
-    """Stub documentado para API/plugin oficial da Nelogica."""
+    """
+    Placeholder para integração oficial da Nelogica.
+
+    Este modo só deve ser habilitado quando houver documentação e credenciais
+    do plugin/API compatível com sua licença do Profit.
+    """
 
     def connect(self) -> None:
         raise NotImplementedError(
-            "Integração Profit API/plugin COM ainda pendente de validação."
+            "Integração Profit API/plugin ainda não foi implementada. "
+            "Ela é a solução recomendada para operar sem Excel oculto."
         )
 
     def subscribe(self, rtd_symbol: str, fields: Iterable[str]) -> None:
@@ -498,8 +672,6 @@ class SimulatedRTDClient(BaseRTDClient):
             "ULT": base,
             "OCP": max(0.01, base - 0.05),
             "OVD": base + 0.05,
-            "VEN": 20261016,
-            "PEX": random.choice([170, 175, 180, 185, 190, 195, 200]),
         }
 
     def poll_updates(
@@ -542,14 +714,17 @@ def create_rtd_client(
     server_url: str = "",
     api_key: str = "",
 ) -> BaseRTDClient:
-    mode_l = mode.lower()
+    mode_l = mode.lower().strip()
 
-    if mode_l == "com":
+    if mode_l in {"excel_bridge", "excel", "com"}:
         return ExcelBridgeRTDClient(
             logger,
             server_url=server_url,
             api_key=api_key,
         )
+
+    if mode_l in {"com_probe", "probe"}:
+        return ComProbeRTDClient(logger)
 
     if mode_l == "profit_api":
         return ProfitApiRtdClient()
@@ -557,4 +732,7 @@ def create_rtd_client(
     if mode_l == "simulate":
         return SimulatedRTDClient()
 
-    raise ValueError(f"Modo RTD inválido: {mode}")
+    raise ValueError(
+        "Modo RTD inválido. Use excel_bridge, com_probe, "
+        "profit_api ou simulate."
+    )

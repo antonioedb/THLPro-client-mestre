@@ -12,6 +12,9 @@ from thlpro_client.timezone_utils import now_iso_sp
 
 EXCEL_ERROR_LIMIT = -2140000000
 
+OPTION_FIELDS = ["ULT", "OCP", "OVD"]
+ASSET_FIELDS = ["ULT"]
+
 
 def is_valid_number(value: Any) -> bool:
     if isinstance(value, bool):
@@ -28,13 +31,70 @@ def is_valid_number(value: Any) -> bool:
             return False
 
         try:
-            number = float(value)
-        except ValueError:
+            number = to_float(value)
+        except (TypeError, ValueError):
             return False
 
-        return math.isfinite(number) and number > EXCEL_ERROR_LIMIT
+        return (
+            number is not None
+            and math.isfinite(number)
+            and number > EXCEL_ERROR_LIMIT
+        )
 
     return False
+
+
+def to_float(value: Any) -> float | None:
+    """
+    Converte números recebidos pelo Excel/RTD para float.
+
+    Trata formatos brasileiros e internacionais sem corromper a parte decimal:
+    - 200.15
+    - 200,15
+    - 1.234,56
+    - 1,234.56
+    """
+    if isinstance(value, bool):
+        return None
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+
+    if not isinstance(value, str):
+        return None
+
+    normalized = value.strip()
+
+    if not normalized or normalized.startswith("#"):
+        return None
+
+    normalized = normalized.replace("R$", "").replace(" ", "")
+
+    comma_count = normalized.count(",")
+    dot_count = normalized.count(".")
+
+    if comma_count and dot_count:
+        last_comma = normalized.rfind(",")
+        last_dot = normalized.rfind(".")
+
+        if last_comma > last_dot:
+            # Exemplo: 1.234,56
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            # Exemplo: 1,234.56
+            normalized = normalized.replace(",", "")
+
+    elif comma_count:
+        # Exemplo: 200,15
+        normalized = normalized.replace(",", ".")
+
+    try:
+        number = float(normalized)
+    except ValueError:
+        return None
+
+    return number if math.isfinite(number) else None
 
 
 def infer_asset(
@@ -42,16 +102,18 @@ def infer_asset(
     option_symbol: str,
 ) -> str:
     symbols = [
-        asset.get("symbol", "")
+        str(asset.get("symbol", "")).upper()
         for asset in assets
         if asset.get("symbol")
     ]
 
     def asset_root(symbol: str) -> str:
-        i = len(symbol)
-        while i > 0 and symbol[i - 1].isdigit():
-            i -= 1
-        return symbol[:i] if i > 0 else symbol
+        index = len(symbol)
+
+        while index > 0 and symbol[index - 1].isdigit():
+            index -= 1
+
+        return symbol[:index] if index > 0 else symbol
 
     roots = sorted(
         [(symbol, asset_root(symbol)) for symbol in symbols],
@@ -59,8 +121,10 @@ def infer_asset(
         reverse=True,
     )
 
+    option_upper = option_symbol.upper()
+
     for symbol, root in roots:
-        if root and option_symbol.startswith(root):
+        if root and option_upper.startswith(root):
             return symbol
 
     return symbols[0] if symbols else "BOVA11"
@@ -88,62 +152,109 @@ class CaptureService:
         self._pause.set()
 
         self._lock = Lock()
+
+        # Últimos valores válidos dos campos das opções.
         self._last_values: dict[str, dict[str, Any]] = {}
+
+        # Último ULT válido de cada ativo-base. O ConfigPollerService usa
+        # estes spots para solicitar ao backend somente strikes relevantes.
+        self._asset_spots: dict[str, float] = {}
+
+        # Último spot já registrado no log por ativo.
+        self._logged_asset_spots: dict[str, float] = {}
+
+        # Metadados somente das opções efetivamente assinadas.
         self._meta_by_rtd: dict[str, dict[str, Any]] = {}
 
+        # Itens aguardando assinatura no Excel/RTD.
         self._pending_series: list[dict[str, Any]] = []
         self._pending_assets: list[str] = []
 
+        # Evitam duplicação enquanto os itens aguardam assinatura.
+        self._pending_series_symbols: set[str] = set()
+        self._pending_asset_symbols: set[str] = set()
+
+        # Somente símbolos confirmados pelo subscribe_batch.
         self._configured_symbols: set[str] = set()
         self._asset_symbols: set[str] = set()
 
+    def get_asset_spots(self) -> dict[str, float]:
+        """
+        Retorna uma cópia segura do último ULT de cada ativo-base.
+
+        Exemplo:
+        {
+            "BOVA11": 205.55,
+            "ABEV3": 15.99,
+        }
+        """
+        with self._lock:
+            return dict(self._asset_spots)
+
     def set_pending_config(self, config_payload: dict[str, Any]) -> None:
+        """
+        Recebe a configuração do backend sem duplicar símbolos já
+        configurados ou aguardando assinatura.
+        """
         assets = config_payload.get("assets", [])
         active_series = config_payload.get("active_series", [])
 
-        new_series = []
-
-        for row in active_series:
-            option_symbol = row["option_symbol"]
-
-            if option_symbol in self._configured_symbols:
-                continue
-
-            new_series.append(
-                {
-                    "id": row.get("id"),
-                    "option_symbol": option_symbol,
-                    "option_type": row.get("option_type"),
-                    "strike": str(row.get("strike")),
-                    "expiration_date": row.get("expiration_date"),
-                    "asset": infer_asset(assets, option_symbol),
-                }
-            )
-
-        new_assets = []
-
-        for asset in assets:
-            symbol = asset.get("symbol")
-
-            if not symbol:
-                continue
-
-            if symbol in self._asset_symbols:
-                continue
-
-            if symbol in self._pending_assets:
-                continue
-
-            new_assets.append(symbol)
+        new_series: list[dict[str, Any]] = []
+        new_assets: list[str] = []
 
         with self._lock:
+            for row in active_series:
+                option_symbol = str(row.get("option_symbol", "")).upper()
+
+                if not option_symbol:
+                    continue
+
+                if option_symbol in self._configured_symbols:
+                    continue
+
+                if option_symbol in self._pending_series_symbols:
+                    continue
+
+                new_series.append(
+                    {
+                        "id": row.get("id"),
+                        "option_symbol": option_symbol,
+                        "option_type": row.get("option_type"),
+                        "strike": str(row.get("strike")),
+                        "expiration_date": row.get("expiration_date"),
+                        "asset": infer_asset(assets, option_symbol),
+                    }
+                )
+                self._pending_series_symbols.add(option_symbol)
+
+            for asset in assets:
+                symbol = str(asset.get("symbol", "")).upper()
+
+                if not symbol:
+                    continue
+
+                if symbol in self._asset_symbols:
+                    continue
+
+                if symbol in self._pending_asset_symbols:
+                    continue
+
+                new_assets.append(symbol)
+                self._pending_asset_symbols.add(symbol)
+
             self._pending_series.extend(new_series)
             self._pending_assets.extend(new_assets)
 
+            pending_series_count = len(self._pending_series)
+            pending_asset_count = len(self._pending_assets)
+
         self.logger.info(
-            "Configuração recebida: %s novas séries e %s novos ativos-base pendentes.",
+            "Configuração recebida: %s novas séries e %s novos ativos-base. "
+            "Fila atual: %s séries e %s ativos-base.",
             len(new_series),
             len(new_assets),
+            pending_series_count,
+            pending_asset_count,
         )
 
     def _configure_series_batch(self, batch_size: int = 100) -> int:
@@ -151,45 +262,105 @@ class CaptureService:
             batch = self._pending_series[:batch_size]
             self._pending_series = self._pending_series[batch_size:]
 
-        configured_symbols: list[str] = []
+            for row in batch:
+                self._pending_series_symbols.discard(row["option_symbol"])
+
+        if not batch:
+            return 0
+
+        symbols = [row["option_symbol"] for row in batch]
 
         for row in batch:
-            option_symbol = row["option_symbol"]
             option_series_id = row.get("id")
 
             if option_series_id is not None:
                 self.rtd_client.register_meta(
                     option_series_id,
-                    option_symbol,
+                    row["option_symbol"],
                 )
 
-            meta = {
-                "id": option_series_id,
-                "asset": row["asset"],
-                "option_symbol": option_symbol,
-                "option_type": row.get("option_type"),
-                "strike": row.get("strike"),
-                "expiration_date": row.get("expiration_date"),
-            }
+        try:
+            subscribed_symbols = set(
+                self.rtd_client.subscribe_batch(
+                    symbols,
+                    OPTION_FIELDS,
+                )
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "Falha ao assinar lote de %s opções no RTD: %s",
+                len(batch),
+                exc,
+            )
+            subscribed_symbols = set()
 
-            with self._lock:
+        configured_count = 0
+        retry_rows: list[dict[str, Any]] = []
+
+        with self._lock:
+            for row in batch:
+                option_symbol = row["option_symbol"]
+
+                if option_symbol not in subscribed_symbols:
+                    retry_rows.append(row)
+                    continue
+
                 self._configured_symbols.add(option_symbol)
-                self._meta_by_rtd[option_symbol] = meta
+                self._meta_by_rtd[option_symbol] = {
+                    "id": row.get("id"),
+                    "asset": row["asset"],
+                    "option_symbol": option_symbol,
+                    "option_type": row.get("option_type"),
+                    "strike": row.get("strike"),
+                    "expiration_date": row.get("expiration_date"),
+                }
+                configured_count += 1
 
-            configured_symbols.append(option_symbol)
+            for row in retry_rows:
+                option_symbol = row["option_symbol"]
 
-        if configured_symbols:
-            configured_symbols = self.rtd_client.subscribe_batch(
-                configured_symbols,
-                ["ULT", "OCP", "OVD", "VEN", "PEX"],
+                if option_symbol in self._configured_symbols:
+                    continue
+
+                if option_symbol in self._pending_series_symbols:
+                    continue
+
+                self._pending_series.append(row)
+                self._pending_series_symbols.add(option_symbol)
+
+            pending_count = len(self._pending_series)
+
+        if retry_rows:
+            failed_symbols = ", ".join(
+                row["option_symbol"] for row in retry_rows[:10]
+            )
+            suffix = "..." if len(retry_rows) > 10 else ""
+
+            self.logger.warning(
+                "RTD não confirmou %s opções; elas voltarão à fila. "
+                "Exemplos: %s%s",
+                len(retry_rows),
+                failed_symbols,
+                suffix,
             )
 
-        return len(configured_symbols)
+        self.logger.info(
+            "Assinatura RTD de opções: solicitadas=%s confirmadas=%s "
+            "pendentes=%s",
+            len(batch),
+            configured_count,
+            pending_count,
+        )
+
+        return configured_count
 
     def _configure_asset_batch(self, batch_size: int = 50) -> int:
         with self._lock:
             batch = self._pending_assets[:batch_size]
             self._pending_assets = self._pending_assets[batch_size:]
+
+            for symbol in batch:
+                self._pending_asset_symbols.discard(symbol)
 
         if not batch:
             return 0
@@ -197,42 +368,93 @@ class CaptureService:
         for symbol in batch:
             self.rtd_client.register_asset(symbol)
 
-            with self._lock:
-                self._asset_symbols.add(symbol)
+        try:
+            subscribed_symbols = set(
+                self.rtd_client.subscribe_batch(
+                    batch,
+                    ASSET_FIELDS,
+                )
+            )
+        except Exception as exc:
+            self.logger.exception(
+                "Falha ao assinar lote de %s ativos-base no RTD: %s",
+                len(batch),
+                exc,
+            )
+            subscribed_symbols = set()
 
-        configured = self.rtd_client.subscribe_batch(
-            batch,
-            ["ULT"],
+        configured_count = 0
+        retry_symbols: list[str] = []
+
+        with self._lock:
+            for symbol in batch:
+                if symbol not in subscribed_symbols:
+                    retry_symbols.append(symbol)
+                    continue
+
+                self._asset_symbols.add(symbol)
+                configured_count += 1
+
+            for symbol in retry_symbols:
+                if symbol in self._asset_symbols:
+                    continue
+
+                if symbol in self._pending_asset_symbols:
+                    continue
+
+                self._pending_assets.append(symbol)
+                self._pending_asset_symbols.add(symbol)
+
+            pending_count = len(self._pending_assets)
+
+        if retry_symbols:
+            self.logger.warning(
+                "RTD não confirmou %s ativos-base; eles voltarão à fila: %s",
+                len(retry_symbols),
+                ", ".join(retry_symbols),
+            )
+
+        self.logger.info(
+            "Assinatura RTD de ativos-base: solicitados=%s confirmados=%s "
+            "pendentes=%s",
+            len(batch),
+            configured_count,
+            pending_count,
         )
 
-        return len(configured)
+        return configured_count
 
-    def start_capture(self):
+    def start_capture(self) -> None:
         self._pause.clear()
 
-    def stop_capture(self):
+    def stop_capture(self) -> None:
         self._pause.set()
 
-    def stop(self):
+    def stop(self) -> None:
         self._stop.set()
 
-    def run_forever(self):
+    def run_forever(self) -> None:
         self.rtd_client.connect()
 
         source = "SIMULATED" if self.simulation_mode else "Profit RTD"
         self.logger.info("Serviço de captura iniciado. source=%s", source)
 
         while not self._stop.is_set():
-            configured_series = self._configure_series_batch(batch_size=100)
             configured_assets = self._configure_asset_batch(batch_size=50)
+            configured_series = self._configure_series_batch(batch_size=100)
 
-            if configured_series or configured_assets:
+            if configured_assets or configured_series:
+                with self._lock:
+                    pending_series_count = len(self._pending_series)
+                    pending_asset_count = len(self._pending_assets)
+
                 self.logger.info(
-                    "Assinadas %s séries e %s ativos-base. Pendentes: %s séries, %s ativos.",
+                    "Assinadas nesta rodada: %s séries e %s ativos-base. "
+                    "Pendentes: %s séries e %s ativos-base.",
                     configured_series,
                     configured_assets,
-                    len(self._pending_series),
-                    len(self._pending_assets),
+                    pending_series_count,
+                    pending_asset_count,
                 )
 
             if self._pause.is_set():
@@ -245,17 +467,17 @@ class CaptureService:
             asset_rows: list[dict[str, Any]] = []
 
             with self._lock:
-                for upd in updates:
-                    if upd.rtd_symbol in self._asset_symbols:
+                for update in updates:
+                    if update.rtd_symbol in self._asset_symbols:
                         self._handle_asset_update(
-                            upd,
+                            update,
                             source,
                             asset_rows,
                         )
                         continue
 
                     self._handle_option_update(
-                        upd,
+                        update,
                         source,
                         option_rows,
                     )
@@ -264,7 +486,8 @@ class CaptureService:
                 inserted = self.queue_enqueue(option_rows)
 
                 self.logger.info(
-                    "Captura: %s cotações de opções enfileiradas. Novas na fila: %s",
+                    "Captura: %s cotações de opções processadas; "
+                    "%s novas na fila.",
                     len(option_rows),
                     inserted,
                 )
@@ -273,27 +496,31 @@ class CaptureService:
                 inserted = self.queue_enqueue_asset(asset_rows)
 
                 self.logger.info(
-                    "Captura: %s cotações de ativos-base enfileiradas. Novas na fila: %s",
+                    "Captura: %s cotações de ativos-base processadas; "
+                    "%s novas na fila.",
                     len(asset_rows),
                     inserted,
                 )
 
     def _handle_option_update(
         self,
-        upd,
+        update,
         source: str,
         rows: list[dict[str, Any]],
     ) -> None:
-        meta = self._meta_by_rtd.get(upd.rtd_symbol)
+        meta = self._meta_by_rtd.get(update.rtd_symbol)
 
         if not meta:
             return
 
-        if not is_valid_number(upd.value):
+        if update.field not in OPTION_FIELDS:
+            return
+
+        if not is_valid_number(update.value):
             return
 
         bucket = self._last_values.setdefault(
-            upd.rtd_symbol,
+            update.rtd_symbol,
             {
                 "ULT": None,
                 "OCP": None,
@@ -301,7 +528,7 @@ class CaptureService:
             },
         )
 
-        bucket[upd.field] = upd.value
+        bucket[update.field] = update.value
 
         last_price = bucket.get("ULT")
         bid = bucket.get("OCP")
@@ -321,7 +548,7 @@ class CaptureService:
             "bid": bid,
             "ask": ask,
             "premium": last_price,
-            "quote_timestamp": upd.timestamp or now_iso_sp(),
+            "quote_timestamp": update.timestamp or now_iso_sp(),
             "source": source,
             "data_status": "OK",
         }
@@ -331,26 +558,57 @@ class CaptureService:
 
     def _handle_asset_update(
         self,
-        upd,
+        update,
         source: str,
         rows: list[dict[str, Any]],
     ) -> None:
-        if upd.field != "ULT":
+        if update.field != "ULT":
             return
 
-        if not is_valid_number(upd.value):
+        if not is_valid_number(update.value):
             return
+
+        spot = to_float(update.value)
+
+        if spot is None or spot <= 0:
+            return
+
+        symbol = update.rtd_symbol.upper()
+
+        # Este método é chamado sob self._lock no loop principal.
+        self._asset_spots[symbol] = spot
+
+        logged_spot = self._logged_asset_spots.get(symbol)
+
+        if (
+            logged_spot is None
+            or not math.isclose(
+                logged_spot,
+                spot,
+                rel_tol=0.0,
+                abs_tol=0.000001,
+            )
+        ):
+            self.logger.info(
+                "Spot RTD atualizado: %s = %.4f",
+                symbol,
+                spot,
+            )
+            self._logged_asset_spots[symbol] = spot
 
         payload = {
-            "asset": upd.rtd_symbol,
-            "last_price": upd.value,
+            "asset": symbol,
+            "last_price": spot,
             "variation_points": None,
             "variation_pct": None,
             "high": None,
             "low": None,
-            "quote_timestamp": upd.timestamp or now_iso_sp(),
+            "quote_timestamp": update.timestamp or now_iso_sp(),
             "source": source,
             "data_status": "OK",
         }
 
-        rows.append(payload)
+        # Os ativos continuam atualizando _asset_spots em toda leitura,
+        # mas somente vão para a fila se houver mudança ou refresh periódico.
+        if self.deduplicator.should_send(payload):
+            rows.append(payload)

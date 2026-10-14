@@ -9,7 +9,10 @@ import time
 from thlpro_client.api_client import APIError, THLProAPIClient
 from thlpro_client.app_paths import CLIENT_MUTEX_NAME, ensure_app_dirs
 from thlpro_client.capture_service import CaptureService
-from thlpro_client.compat_windows import create_single_instance_lock, release_single_instance_lock
+from thlpro_client.compat_windows import (
+    create_single_instance_lock,
+    release_single_instance_lock,
+)
 from thlpro_client.config import ConfigStore
 from thlpro_client.config_poller import ConfigPollerService
 from thlpro_client.dedup_cache import QuoteDeduplicator
@@ -24,32 +27,126 @@ from thlpro_client.tray_ui import TrayApp
 
 VERSION = "0.4.0"
 
+VALID_RTD_MODES = {
+    "excel_bridge",
+    "excel",
+    "com",
+    "com_probe",
+    "probe",
+    "profit_api",
+    "simulate",
+}
 
-def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> int:
+
+def resolve_rtd_mode(
+    config_simulate: bool,
+    simulate_override: bool | None,
+    cli_rtd_mode: str | None,
+) -> str:
+    """
+    Define o modo RTD por ordem de prioridade:
+
+    1. --simulate
+    2. --rtd-mode
+    3. variável RTD_MODE
+    4. modo legado compatível: excel_bridge
+
+    excel_bridge ainda usa Excel oculto e pode conflitar com planilhas
+    manuais que usam RTD na mesma máquina.
+    """
+    if simulate_override is True:
+        return "simulate"
+
+    if config_simulate or os.getenv("SIMULATE", "0") == "1":
+        return "simulate"
+
+    selected = (
+        cli_rtd_mode
+        or os.getenv("RTD_MODE", "")
+        or "excel_bridge"
+    ).lower().strip()
+
+    if selected not in VALID_RTD_MODES:
+        valid = ", ".join(sorted(VALID_RTD_MODES))
+
+        raise RuntimeError(
+            f"RTD_MODE inválido: {selected!r}. Modos aceitos: {valid}."
+        )
+
+    return selected
+
+
+def log_rtd_mode_warning(
+    logger,
+    rtd_mode: str,
+) -> None:
+    if rtd_mode in {"excel_bridge", "excel", "com"}:
+        logger.warning(
+            "Modo RTD=%s: o cliente abrirá um Excel oculto para ler o "
+            "RTD do Profit. Não use planilhas Excel com fórmulas RTD "
+            "simultaneamente nesta máquina, pois o servidor RTD pode "
+            "conflitar entre instâncias do Excel.",
+            rtd_mode,
+        )
+        return
+
+    if rtd_mode in {"com_probe", "probe"}:
+        logger.warning(
+            "Modo RTD=%s: diagnóstico COM sem Excel. Este modo não "
+            "captura nem envia cotações.",
+            rtd_mode,
+        )
+        return
+
+    if rtd_mode == "profit_api":
+        logger.info(
+            "Modo RTD=profit_api: integração sem Excel oculto. "
+            "Requer implementação e credenciais compatíveis da API/plugin."
+        )
+        return
+
+    if rtd_mode == "simulate":
+        logger.info(
+            "Modo RTD=simulate: serão geradas cotações de teste."
+        )
+
+
+def run_client(
+    simulate_override: bool | None = None,
+    no_gui: bool = False,
+    rtd_mode_override: str | None = None,
+) -> int:
     paths = ensure_app_dirs()
-    logger = configure_logging(str(paths["logs"] / "thlpro_client.log"))
+    logger = configure_logging(
+        str(paths["logs"] / "thlpro_client.log")
+    )
 
-    lock_obj, already_running = create_single_instance_lock(CLIENT_MUTEX_NAME)
+    lock_obj, already_running = create_single_instance_lock(
+        CLIENT_MUTEX_NAME
+    )
+
     if already_running:
         logger.error("Já existe uma instância do THLPro Client em execução.")
         return 2
 
     store = ConfigStore(paths["config"])
     config = store.load()
+
     runtime_password = ""
     running = True
     capture_started = True
 
     def on_save(updated, password):
         nonlocal config, runtime_password
+
         config = updated
         runtime_password = password
         store.save(config)
 
     try:
         if (not config.email or not config.server_url) and not no_gui:
-            cfg_window = ConfigWindow(config, on_save=on_save)
-            cfg_window.run()
+            config_window = ConfigWindow(config, on_save=on_save)
+            config_window.run()
 
         if simulate_override is not None:
             config.simulate = simulate_override
@@ -62,26 +159,45 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
 
         if runtime_password:
             api.login(config.email, runtime_password)
-            reg = api.register_client(config.client_name, config.computer_name, VERSION)
-            store.set_api_key(config, reg["api_key"])
-            logger.info("Cliente registrado com id=%s", reg["client_id"])
+
+            registration = api.register_client(
+                config.client_name,
+                config.computer_name,
+                VERSION,
+            )
+
+            store.set_api_key(config, registration["api_key"])
+
+            logger.info(
+                "Cliente registrado com id=%s",
+                registration["client_id"],
+            )
 
         api_key = store.read_api_key(config)
+
         if not api_key:
-            raise RuntimeError("API key não encontrada. Abra o app com interface e faça login.")
+            raise RuntimeError(
+                "API key não encontrada. "
+                "Abra o app com interface e faça login."
+            )
+
         api.api_key = api_key
 
-        cfg_payload = api.get_config()
+        initial_config = api.get_config(include_series=False)
+
         logger.info(
-            "Configuração recebida: %s séries ativas",
-            len(cfg_payload.get("active_series", [])),
+            "Configuração inicial recebida: %s ativos-base e %s séries.",
+            len(initial_config.get("assets", [])),
+            len(initial_config.get("active_series", [])),
         )
 
-        rtd_mode = (
-            "simulate"
-            if config.simulate or os.getenv("SIMULATE", "0") == "1"
-            else os.getenv("RTD_MODE", "com")
+        rtd_mode = resolve_rtd_mode(
+            config_simulate=config.simulate,
+            simulate_override=simulate_override,
+            cli_rtd_mode=rtd_mode_override,
         )
+
+        log_rtd_mode_warning(logger, rtd_mode)
 
         rtd = create_rtd_client(
             rtd_mode,
@@ -91,7 +207,10 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
         )
 
         queue = OfflineQueue(paths["queue"])
-        dedup = QuoteDeduplicator(min_interval_ms=config.min_send_interval_ms)
+
+        dedup = QuoteDeduplicator(
+            min_interval_ms=config.min_send_interval_ms
+        )
 
         capture = CaptureService(
             logger=logger,
@@ -112,14 +231,24 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
         poller = ConfigPollerService(
             logger=logger,
             api_client=api,
-            on_config=lambda c: capture.set_pending_config(c),
+            capture_service=capture,
+            on_config=lambda payload: capture.set_pending_config(payload),
             interval_seconds=config.poll_config_seconds,
         )
 
         workers = [
-            WorkerSpec(name="capture_worker", target=capture.run_forever),
-            WorkerSpec(name="sender_worker", target=sender.run_forever),
-            WorkerSpec(name="config_poller_worker", target=poller.run_forever),
+            WorkerSpec(
+                name="capture_worker",
+                target=capture.run_forever,
+            ),
+            WorkerSpec(
+                name="sender_worker",
+                target=sender.run_forever,
+            ),
+            WorkerSpec(
+                name="config_poller_worker",
+                target=poller.run_forever,
+            ),
         ]
 
         supervisor = WatchdogSupervisor(logger, workers)
@@ -132,7 +261,7 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
         )
         watchdog_thread.start()
 
-        capture.set_pending_config(cfg_payload)
+        capture.set_pending_config(initial_config)
         capture.start_capture()
 
         def open_config_window():
@@ -140,11 +269,12 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
                 logger.info("UI desabilitada (modo no-gui).")
                 return
 
-            cfg_window = ConfigWindow(config, on_save=on_save)
-            cfg_window.run()
+            config_window = ConfigWindow(config, on_save=on_save)
+            config_window.run()
 
         def toggle_capture():
             nonlocal capture_started
+
             capture_started = not capture_started
 
             if capture_started:
@@ -156,11 +286,21 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
 
         def stop_everything():
             nonlocal running
+
             running = False
             capture.stop()
             sender.stop()
             poller.stop()
             supervisor.stop()
+
+            try:
+                rtd.close()
+            except Exception as exc:
+                logger.warning(
+                    "Falha ao encerrar cliente RTD: %s",
+                    exc,
+                )
+
             logger.info("Encerrando serviços do cliente")
 
         if not no_gui:
@@ -179,7 +319,8 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
             tray_thread.start()
 
         logger.info(
-            "Cliente THLPro iniciado. Modo simulação: %s",
+            "Cliente THLPro iniciado. rtd_mode=%s; simulação=%s",
+            rtd_mode,
             rtd_mode == "simulate",
         )
 
@@ -220,24 +361,40 @@ def run_client(simulate_override: bool | None = None, no_gui: bool = False) -> i
 
 def parse_args():
     parser = argparse.ArgumentParser(description="THLPro Client")
+
     parser.add_argument(
         "--simulate",
         action="store_true",
         help="Força modo simulação",
     )
+
     parser.add_argument(
         "--no-gui",
         action="store_true",
         help="Executa sem abrir janela",
     )
+
+    parser.add_argument(
+        "--rtd-mode",
+        choices=sorted(VALID_RTD_MODES),
+        default=None,
+        help=(
+            "Modo de captura RTD. "
+            "excel_bridge abre Excel oculto; com_probe apenas diagnostica; "
+            "profit_api depende de integração oficial; simulate gera testes."
+        ),
+    )
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
     return run_client(
         simulate_override=True if args.simulate else None,
         no_gui=args.no_gui,
+        rtd_mode_override=args.rtd_mode,
     )
 
 
